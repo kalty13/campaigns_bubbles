@@ -2,9 +2,12 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Weekly Bubble — Campaign Performance</title>
+  <title>Weekly Bubble — Fixed</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Plotly -->
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <!-- PapaParse (robust CSV) -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <style>
     body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#eaecef;background:#0f1115}
     .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:12px}
@@ -15,19 +18,17 @@
     #weeks{min-width:220px;height:110px}
     .btn{cursor:pointer;font-size:12px;padding:6px 10px}
     .hint{color:#9aa4b2;font-size:12px;margin-top:6px}
+    .warn{background:#2a1a1a;color:#ff9a9a;border:1px solid #5a2a2a;padding:8px 10px;border-radius:10px;margin:8px 0;display:none}
     table{width:100%;border-collapse:collapse;margin-top:14px;font-size:13px}
     th,td{padding:8px 10px;border-bottom:1px solid #2a2f3a}
     th{text-align:left;color:#c7d0dd}
     tr:hover{background:#151820}
     .num{text-align:right;font-variant-numeric:tabular-nums}
     .tag{padding:2px 6px;border-radius:6px;border:1px solid #2a2f3a;font-size:12px}
-    .panel{margin-top:16px;padding:12px;border:1px solid #2a2f3a;border-radius:12px;background:#131722}
-    .panel h3{margin:0 0 8px 0;font-size:16px}
-    #insightChart{width:100%;height:300px}
   </style>
 </head>
 <body>
-  <h2>Campaigns (weekly) — ROAS/LTV & CPI/LTV — Bubble Report</h2>
+  <h2>Campaigns (weekly) — ROAS/LTV & CPI/LTV — Bubble Report (Fixed)</h2>
 
   <div class="row">
     <div class="card"><label>CSV:</label><input type="file" id="file" accept=".csv" /></div>
@@ -72,22 +73,9 @@
     </div>
   </div>
 
+  <div id="emptyWarn" class="warn"></div>
   <div id="chart"></div>
   <div class="hint">Красная пунктирная линия — ROAS 0.40 (в режиме ROAS↔LTV). В левом верхнем углу — общий spend «красной» зоны, в правом — «зелёной».</div>
-
-  <div class="panel">
-    <h3>Insights — CPI ↔ LTV trend (по текущему фильтру)</h3>
-    <button class="btn" id="trend">Compute CPI↔LTV Trend</button>
-    <div class="hint" id="trendStats">Kendall’s tau + p-value; ниже — LTV по квинтилям CPI с долями spend/installs.</div>
-    <div id="insightChart"></div>
-    <table id="qTable">
-      <thead><tr>
-        <th>Quintile</th><th class="num">CPI min</th><th class="num">CPI max</th><th class="num">CPI avg</th>
-        <th class="num">LTV avg</th><th class="num">LTV median</th><th class="num">n</th>
-        <th class="num">Spend</th><th class="num">Spend share</th><th class="num">Installs</th><th class="num">Installs share</th>
-      </tr></thead><tbody></tbody>
-    </table>
-  </div>
 
   <table id="grid">
     <thead>
@@ -101,105 +89,125 @@
   </table>
 
 <script>
-const TARGET=0.40;
-let RAW=[]; let WEEKS=[];
-const $ = id => document.getElementById(id);
+const TARGET=0.40; let RAW=[]; let WEEKS=[];
+const $=id=>document.getElementById(id);
 
 function pick(cols, patterns){
   for (const p of patterns){
-    const rx = new RegExp(p,'i');
-    const hit = cols.find(c => rx.test(c));
+    const rx=new RegExp(p,'i'); const hit=cols.find(c=>rx.test(c));
     if (hit) return hit;
   }
   return null;
 }
-
-function parseCSV(text){
-  // tiny robust CSV (no quotes edge cases), good enough for our exports
-  const lines = text.replace(/\r/g,'\n').split('\n').filter(x=>x.trim().length);
-  const header = lines[0].split(',').map(s=>s.trim());
-  const rows = lines.slice(1).map(l => {
-    const cells = l.split(','); const obj={};
-    header.forEach((h,i)=>obj[h]=cells[i]);
-    return obj;
-  });
-  return {header, rows};
+function toNum(v){
+  if (v==null) return null;
+  const s=String(v).trim().replace(/\$/g,'').replace(/%/g,'').replace(/,/g,'');
+  if (s==='') return null;
+  const x=parseFloat(s);
+  return isFinite(x)?x:null;
 }
-function toNum(v){ const x = parseFloat(String(v).replace(/,/g,'')); return isFinite(x)?x:null; }
-function weekStart(dateStr){
-  const d = new Date(dateStr);
-  if (isNaN(d)) return null;
-  const wd = d.getDay(); // 0..6 (Sun..Sat)
-  const delta = (wd+6)%7; // make Monday=0
-  const s = new Date(d); s.setDate(d.getDate()-delta); s.setHours(0,0,0,0);
+// parse many date formats → YYYY-MM-DD week start (Mon)
+function parseDateFlexible(s){
+  if (!s) return null;
+  s=String(s).trim();
+  // ISO or RFC friendly
+  let d=new Date(s);
+  if (!isNaN(d)) return d;
+  // DD.MM.YYYY
+  let m=s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (m){ return new Date(Number(m[3]), Number(m[2])-1, Number(m[1])); }
+  // MM/DD/YYYY
+  m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m){ return new Date(Number(m[3]), Number(m[1])-1, Number(m[2])); }
+  // YYYY/MM/DD
+  m=s.match(/^(\d{4})[\/\.](\d{1,2})[\/\.](\d{1,2})$/);
+  if (m){ return new Date(Number(m[1]), Number(m[2])-1, Number(m[3])); }
+  return null;
+}
+function weekStartStr(dateStr){
+  const d=parseDateFlexible(dateStr);
+  if (!d) return null;
+  const wd=(d.getDay()+6)%7; // Mon=0
+  const s=new Date(d); s.setDate(d.getDate()-wd); s.setHours(0,0,0,0);
   return s.toISOString().slice(0,10);
 }
 function inferType(name){
-  const s = (name||'').toUpperCase();
+  const s=(name||'').toUpperCase();
   if (s.includes('ROAS')) return 'ROAS';
   if (s.includes('TCPA')) return 'TCPA';
   return 'Unknown';
 }
 
-function ingest(text){
-  const {header, rows} = parseCSV(text);
-  const cCampaign = pick(header, [String.raw`\bcampaign(_name)?\b`, String.raw`\butm_?campaign\b`, String.raw`^campaign$`]) || header[0];
-  const cSpend   = pick(header, [String.raw`\b(cost|spend|ad_?cost|expenses|total[_\s-]?cost)\b`, String.raw`^cost$`, String.raw`^spend$`]);
-  const cRoas0   = pick(header, [String.raw`\broas[_\s-]?(d0|0w|w0)\b`, String.raw`\broas\s*0w\b`, String.raw`^roas_d0$`]);
-  const cLtv0    = pick(header, [String.raw`(lifetime[_\s-]?value|ltv)[_\s-]?(d0|0w|w0)\b`, String.raw`\bltv\s*0w\b`, String.raw`^lifetime_value_d0$`]);
-  const cDate    = pick(header, [String.raw`\b(date|day|event[_\s-]?date|install[_\s-]?date|time[_\s-]?date)\b`]);
-  const cImpr    = pick(header, [String.raw`\bimpr(essions)?\b`, String.raw`\bimpressions\b`]);
-  const cInst    = pick(header, [String.raw`\binstalls?\b`, String.raw`\binstall_count\b`]);
-  const cCPM     = pick(header, [String.raw`\bcpm\b`]);
-  const cCPI     = pick(header, [String.raw`\bcpi\b`]);
-  const cRoas10  = pick(header, [String.raw`\broas[_\s-]?(d10|10d|day10|10[_\s-]?day)\b`, String.raw`^roas_d10$`]);
+function ingest(papa){
+  const rows=papa.data;
+  const header=papa.meta.fields || Object.keys(rows[0]||{});
+  // allow "week" column as direct week key
+  const cWeek = pick(header,[String.raw`\bweek(_start)?\b`]);
+  const cCampaign = pick(header,[String.raw`\bcampaign(_name)?\b`, String.raw`\butm_?campaign\b`, String.raw`^campaign$`]) || header[0];
+  const cSpend   = pick(header,[String.raw`\b(cost|spend|ad_?cost|expenses|total[_\s-]?cost)\b`, String.raw`^cost$`, String.raw`^spend$`]);
+  const cRoas0   = pick(header,[String.raw`\broas[_\s-]?(d0|0w|w0)\b`, String.raw`\broas\s*0w\b`, String.raw`^roas_d0$`]);
+  const cLtv0    = pick(header,[String.raw`(lifetime[_\s-]?value|ltv)[_\s-]?(d0|0w|w0)\b`, String.raw`\bltv\s*0w\b`, String.raw`^lifetime_value_d0$`]);
+  const cDate    = cWeek ? null : pick(header,[String.raw`\b(date|day|event[_\s-]?date|install[_\s-]?date|time[_\s-]?date)\b`]);
+  const cImpr    = pick(header,[String.raw`\bimpr(essions)?\b`, String.raw`\bimpressions\b`]);
+  const cInst    = pick(header,[String.raw`\binstalls?\b`, String.raw`\binstall_count\b`]);
+  const cCPM     = pick(header,[String.raw`\bcpm\b`]);
+  const cCPI     = pick(header,[String.raw`\bcpi\b`]);
+  const cRoas10  = pick(header,[String.raw`\broas[_\s-]?(d10|10d|day10|10[_\s-]?day)\b`, String.raw`^roas_d10$`]);
 
-  // group by week+campaign with spend-weighted means
-  const map = new Map();
+  const map=new Map();
   for (const r of rows){
-    const key = (r[cCampaign]||'unknown') + '|' + (cDate? weekStart(r[cDate]) : 'all');
-    const o = map.get(key) || {campaign:r[cCampaign]||'unknown', week_start:(cDate? weekStart(r[cDate]) : null), type:inferType(r[cCampaign]),
-      spend:0, roas0_sum:0, ltv0_sum:0, roas10_sum:0, impr:0, inst:0, cpm_sum:0, cpi_sum:0, w_roas0:0, w_ltv0:0, w_roas10:0, w_cpm:0, w_cpi:0};
-    const cost = toNum(r[cSpend]); if (cost) o.spend += cost;
+    const week = cWeek ? (String(r[cWeek]||'').slice(0,10)||null) : (cDate ? weekStartStr(r[cDate]) : null);
+    const camp = r[cCampaign] ?? 'unknown';
+    const key = camp + '|' + (week||'all');
 
-    const roas0 = toNum(r[cRoas0]); if (roas0!=null && cost){ o.roas0_sum += roas0*cost; o.w_roas0 += cost; }
-    const ltv0  = toNum(r[cLtv0]);  if (ltv0!=null && cost){  o.ltv0_sum  += ltv0*cost;  o.w_ltv0  += cost; }
-    const roas10= toNum(r[cRoas10]);if (roas10!=null && cost){ o.roas10_sum+= roas10*cost; o.w_roas10+= cost; }
+    const cost = toNum(r[cSpend]);
+    const roas0= toNum(r[cRoas0]);
+    const ltv0 = toNum(r[cLtv0]);
+    let roas10 = toNum(r[cRoas10]);
+    const impr = toNum(r[cImpr]);
+    const inst = toNum(r[cInst]);
+    const cpm  = toNum(r[cCPM]);
+    const cpi  = toNum(r[cCPI]);
 
-    const impr = toNum(r[cImpr]); if (impr) o.impr += impr;
-    const inst = toNum(r[cInst]); if (inst) o.inst += inst;
+    const o = map.get(key) || {campaign:camp, week_start:week, type:inferType(camp),
+      spend:0, roas0_sum:0, ltv0_sum:0, roas10_sum:0, w_roas0:0, w_ltv0:0, w_roas10:0,
+      impr:0, inst:0, cpm_sum:0, w_cpm:0, cpi_sum:0, w_cpi:0};
+    if (cost) o.spend += cost;
 
-    const cpm = toNum(r[cCPM]); if (cpm!=null && cost){ o.cpm_sum += cpm*cost; o.w_cpm += cost; }
-    const cpi = toNum(r[cCPI]); if (cpi!=null && cost){ o.cpi_sum += cpi*cost; o.w_cpi += cost; }
+    if (roas0!=null && cost){ o.roas0_sum += roas0*cost; o.w_roas0 += cost; }
+    if (ltv0 !=null && cost){ o.ltv0_sum  += ltv0 *cost; o.w_ltv0  += cost; }
+    if (roas10!=null && cost){ 
+      if (roas10>2) roas10 = roas10/100; // percent → fraction
+      o.roas10_sum+= roas10*cost; o.w_roas10+= cost; 
+    }
+    if (impr) o.impr += impr;
+    if (inst) o.inst += inst;
+    if (cpm!=null && cost){ o.cpm_sum += cpm*cost; o.w_cpm += cost; }
+    if (cpi!=null && cost){ o.cpi_sum += cpi*cost; o.w_cpi += cost; }
 
-    map.set(key, o);
+    map.set(key,o);
   }
 
   RAW = Array.from(map.values()).map(o=>{
     const roas0 = o.w_roas0? o.roas0_sum/o.w_roas0 : null;
-    const ltv0  = o.w_ltv0?  o.ltv0_sum /o.w_ltv0  : null;
+    const ltv0  = o.w_ltv0 ? o.ltv0_sum /o.w_ltv0  : null;
     let roas10  = o.w_roas10? o.roas10_sum/o.w_roas10 : null;
-    // normalize if % (e.g. 45 => 0.45)
-    if (roas10!=null && roas10>2) roas10 = roas10/100;
     if (roas10==null && roas0!=null) roas10 = roas0; // proxy
-
     const cpm = o.w_cpm? o.cpm_sum/o.w_cpm : (o.impr>0 && o.spend>0 ? o.spend/o.impr*1000 : null);
     const cpi = o.w_cpi? o.cpi_sum/o.w_cpi : (o.inst>0 && o.spend>0 ? o.spend/o.inst : null);
-
-    const stars = roas10!=null ? Math.max(0, Math.min(5, (roas10/TARGET)*5)) : null;
-    let bucket = "N/A";
+    const stars = roas10!=null ? Math.max(0,Math.min(5,(roas10/TARGET)*5)) : null;
+    let bucket='N/A';
     if (stars!=null){
-      if (stars<2) bucket="0–1.9★"; else if (stars<3) bucket="2.0–2.9★"; else if (stars<4) bucket="3.0–3.9★";
-      else if (stars<4.5) bucket="4.0–4.4★"; else if (stars<5.0) bucket="4.5–4.9★"; else bucket="5.0★";
+      bucket = stars<2?'0–1.9★':(stars<3?'2.0–2.9★':(stars<4?'3.0–3.9★':(stars<4.5?'4.0–4.4★':(stars<5?'4.5–4.9★':'5.0★'))));
     }
-
     return {campaign:o.campaign, week_start:o.week_start, type:o.type,
-      total_spend:o.spend||0, roas_0w:roas0, ltv_0w:ltv0, roas_10d:roas10, impressions:o.impr||0, installs:o.inst||0,
-      cpm:cpm, cpi:cpi, stars:stars, star_bucket:bucket, is_proxy:(o.w_roas10===0 && roas0!=null)};
+      total_spend:o.spend||0, roas_0w:roas0, ltv_0w:ltv0, roas_10d:roas10,
+      impressions:o.impr||0, installs:o.inst||0, cpm:cpm, cpi:cpi, stars:stars, star_bucket:bucket,
+      is_proxy:(o.w_roas10===0 && roas0!=null)};
   });
 
   WEEKS = Array.from(new Set(RAW.map(r=>r.week_start).filter(Boolean))).sort().reverse();
-  const sel = $('weeks'); sel.innerHTML='';
+  const sel=$('weeks'); sel.innerHTML='';
   for (const w of WEEKS){ const opt=document.createElement('option'); opt.value=w; opt.textContent=w; sel.appendChild(opt); }
   updateWeeksInfo();
   render();
@@ -211,47 +219,55 @@ $('all').onclick=()=>{ Array.from($('weeks').options).forEach(o=>o.selected=true
 $('none').onclick=()=>{ Array.from($('weeks').options).forEach(o=>o.selected=false); updateWeeksInfo(); render(); };
 
 function filteredSubset(){
-  const minSpend = parseFloat($('minSpend').value||'0');
-  const weeks = getSelectedWeeks();
-  const minStars = parseFloat($('minStars').value||'0');
+  const minSpend=parseFloat($('minSpend').value||'0');
+  const weeks=getSelectedWeeks();
+  const minStars=parseFloat($('minStars').value||'0');
   return RAW.filter(r=>{
     if (r.total_spend < minSpend) return false;
     if (weeks.length && (!r.week_start || !weeks.includes(r.week_start))) return false;
     if (minStars>0 && !(r.stars>=minStars)) return false;
+    // require valid axes values (checked later)
     return true;
   });
 }
 
 function render(){
-  const axis = $('axisMode').value;
-  const colorBy = $('colorBy').value;
-  const sizeScale = parseFloat($('sizeScale').value||'2.2');
-  const jitter = $('jitter').value;
-  const sub = filteredSubset().filter(r=>{
+  const axis=$('axisMode').value, colorBy=$('colorBy').value, sizeScale=parseFloat($('sizeScale').value||'2.2'), jitter=$('jitter').value;
+  const subset=filteredSubset().filter(r=>{
     if (axis==='roas_ltv') return r.roas_0w!=null && r.ltv_0w!=null;
     if (axis==='cpi_ltv')  return r.cpi!=null && r.ltv_0w!=null;
     if (axis==='ltv_cpi')  return r.ltv_0w!=null && r.cpi!=null;
     return false;
   });
 
-  const groups = (colorBy==='type')? ['ROAS','TCPA','Unknown'] : ['0–1.9★','2.0–2.9★','3.0–3.9★','4.0–4.4★','4.5–4.9★','5.0★'];
+  const warn=$('emptyWarn');
+  if (!subset.length){
+    const weeksTxt = getSelectedWeeks().length ? `Недели: ${getSelectedWeeks().join(', ')}` : 'Недели: все';
+    warn.style.display='block';
+    warn.textContent = `Нет точек для отрисовки. Возможные причины: (1) нет подходящих колонок ROAS/LTV/CPI; (2) формат дат не распознан; (3) фильтры слишком жёсткие (min spend/недели/звёзды). ${weeksTxt}.`;
+  } else {
+    warn.style.display='none';
+    warn.textContent='';
+  }
+
+  const groups=(colorBy==='type')? ['ROAS','TCPA','Unknown'] : ['0–1.9★','2.0–2.9★','3.0–3.9★','4.0–4.4★','4.5–4.9★','5.0★'];
   const traces=[];
   groups.forEach(cat=>{
-    const g = sub.filter(r => (colorBy==='type')? r.type===cat : r.star_bucket===cat);
+    const g=subset.filter(r => (colorBy==='type')? r.type===cat : r.star_bucket===cat);
     if (!g.length) return;
-    const x = g.map((r,i)=>{ let v=(axis==='roas_ltv')? r.roas_0w : (axis==='cpi_ltv'? r.cpi : r.ltv_0w);
-      return v + (jitter==='on' ? (Math.sin(i+1)-Math.floor(Math.sin(i+1)) - .5)*0.01 : 0);});
-    const y = g.map((r,i)=>{ let v=(axis==='roas_ltv')? r.ltv_0w : (axis==='cpi_ltv'? r.ltv_0w : r.cpi);
-      return v + (jitter==='on' ? (Math.sin(i+7)-Math.floor(Math.sin(i+7)) - .5)*0.01 : 0);});
-    const sizes = g.map(r => Math.sqrt(Math.max(1,r.total_spend))*sizeScale);
-    const hover = g.map(r=>{
-      const roas0=(r.roas_0w!=null)? `<br><b>ROAS 0W</b>: ${r.roas_0w.toFixed(3)}`:'';
-      const ltv =(r.ltv_0w !=null)? `<br><b>LTV 0W</b>: ${r.ltv_0w.toFixed(3)}`:'';
-      const cpm =(r.cpm    !=null)? `<br><b>CPM</b>: $${r.cpm.toFixed(3)}`:'';
-      const cpi =(r.cpi    !=null)? `<br><b>CPI</b>: $${r.cpi.toFixed(3)}`:'';
-      const imp =(r.impressions)? `<br><b>Impr</b>: ${Math.round(r.impressions).toLocaleString()}`:'';
-      const inst=(r.installs)? `<br><b>Installs</b>: ${Math.round(r.installs).toLocaleString()}`:'';
-      const stars=(r.stars!=null)? `<br><b>Rating</b>: ${r.stars.toFixed(1)} ★`:'';
+    const x=g.map((r,i)=>{ let v=(axis==='roas_ltv')? r.roas_0w : (axis==='cpi_ltv'? r.cpi : r.ltv_0w);
+      return v + (jitter==='on'? (Math.sin(i+1)-Math.floor(Math.sin(i+1))-.5)*0.01 : 0); });
+    const y=g.map((r,i)=>{ let v=(axis==='roas_ltv')? r.ltv_0w : (axis==='cpi_ltv'? r.ltv_0w : r.cpi);
+      return v + (jitter==='on'? (Math.sin(i+7)-Math.floor(Math.sin(i+7))-.5)*0.01 : 0); });
+    const sizes=g.map(r => Math.sqrt(Math.max(1,r.total_spend))*sizeScale);
+    const hover=g.map(r=>{
+      const roas0=r.roas_0w!=null? `<br><b>ROAS 0W</b>: ${r.roas_0w.toFixed(3)}`:'';
+      const ltv =r.ltv_0w !=null? `<br><b>LTV 0W</b>: ${r.ltv_0w.toFixed(3)}`:'';
+      const cpm =r.cpm    !=null? `<br><b>CPM</b>: $${r.cpm.toFixed(3)}`:'';
+      const cpi =r.cpi    !=null? `<br><b>CPI</b>: $${r.cpi.toFixed(3)}`:'';
+      const imp =r.impressions? `<br><b>Impr</b>: ${Math.round(r.impressions).toLocaleString()}`:'';
+      const inst=r.installs? `<br><b>Installs</b>: ${Math.round(r.installs).toLocaleString()}`:'';
+      const stars=r.stars!=null? `<br><b>Rating</b>: ${r.stars.toFixed(1)} ★`:'';
       return `<b>${r.campaign}</b> — ${r.type}<br><b>Spend</b>: $${r.total_spend.toLocaleString()}`+roas0+ltv+cpm+cpi+imp+inst+stars;
     });
     traces.push({x,y,name:cat,type:'scatter',mode:'markers',marker:{size:sizes,opacity:.65,line:{width:1,color:'#fff'}},hoverinfo:'text',hovertext:hover});
@@ -259,14 +275,14 @@ function render(){
 
   let shapes=[], annotations=[], xTitle='X', yTitle='Y';
   if (axis==='roas_ltv'){
-    const redSpend = sub.filter(r=>r.roas_0w<0.40).reduce((s,r)=>s+(r.total_spend||0),0);
-    const greenSpend = sub.filter(r=>r.roas_0w>=0.40).reduce((s,r)=>s+(r.total_spend||0),0);
-    shapes = [
+    const redSpend=subset.filter(r=>r.roas_0w<0.40).reduce((s,r)=>s+(r.total_spend||0),0);
+    const greenSpend=subset.filter(r=>r.roas_0w>=0.40).reduce((s,r)=>s+(r.total_spend||0),0);
+    shapes=[
       {type:'rect',x0:0,x1:0.40,y0:0,y1:1,xref:'x',yref:'paper',fillcolor:'rgba(255,77,79,0.06)',line:{width:0}},
       {type:'rect',x0:0.40,x1:1,y0:0,y1:1,xref:'x',yref:'paper',fillcolor:'rgba(0,201,87,0.06)',line:{width:0}},
       {type:'line',x0:0.40,x1:0.40,y0:0,y1:1,xref:'x',yref:'paper',line:{dash:'dash',width:2,color:'#ff4d4f'}}
     ];
-    annotations = [
+    annotations=[
       {x:0.40,y:1.02,xref:'x',yref:'paper',xanchor:'center',showarrow:false,text:'Target 0.40',font:{size:12,color:'#ff8080'}},
       {x:0,y:1.02,xref:'paper',yref:'paper',xanchor:'left',showarrow:false,text:`Red spend: $${redSpend.toLocaleString(undefined,{maximumFractionDigits:0})}`,font:{size:12,color:'#ffb3b3'}},
       {x:1,y:1.02,xref:'paper',yref:'paper',xanchor:'right',showarrow:false,text:`Green spend: $${greenSpend.toLocaleString(undefined,{maximumFractionDigits:0})}`,font:{size:12,color:'#7ce3a0'}}
@@ -275,13 +291,16 @@ function render(){
   } else if (axis==='cpi_ltv'){ xTitle='CPI ($)'; yTitle='LTV 0W'; }
   else { xTitle='LTV 0W'; yTitle='CPI ($)'; }
 
-  Plotly.newPlot('chart', traces, {xaxis:{title:xTitle}, yaxis:{title:yTitle},
-    hovermode:'closest', plot_bgcolor:'#0f1115', paper_bgcolor:'#0f1115', font:{color:'#eaecef'},
-    legend:{title:{text:( $('colorBy').value==='type' ? 'Type' : 'Rating')}} , shapes, annotations }, {responsive:true});
+  Plotly.newPlot('chart', traces, {
+    xaxis:{title:xTitle}, yaxis:{title:yTitle}, hovermode:'closest',
+    plot_bgcolor:'#0f1115', paper_bgcolor:'#0f1115', font:{color:'#eaecef'},
+    legend:{title:{text:($('colorBy').value==='type' ? 'Type' : 'Rating')}},
+    shapes, annotations
+  }, {responsive:true});
 
   // table
-  const tbody = document.querySelector('#grid tbody'); tbody.innerHTML='';
-  const sorted = sub.slice().sort((a,b)=>{ const sa=(a.stars??-1), sb=(b.stars??-1); if (sa!==sb) return sb-sa; return (b.total_spend??0)-(a.total_spend??0); });
+  const tbody=document.querySelector('#grid tbody'); tbody.innerHTML='';
+  const sorted=subset.slice().sort((a,b)=>{ const sa=(a.stars??-1), sb=(b.stars??-1); if (sa!==sb) return sb-sa; return (b.total_spend??0)-(a.total_spend??0); });
   for (const r of sorted){
     const tr=document.createElement('tr');
     const td=(h,cls='')=>{const el=document.createElement('td'); if(cls) el.className=cls; el.innerHTML=h; tr.appendChild(el);};
@@ -295,76 +314,21 @@ function render(){
     td(r.impressions? Math.round(r.impressions).toLocaleString():'—','num');
     td(r.installs? Math.round(r.installs).toLocaleString():'—','num');
     const stars=document.createElement('td'); stars.className='num';
-    if (r.stars!=null){ const n=Math.max(0,Math.min(5,Math.round(r.stars))); stars.innerHTML=`<span title="${r.stars.toFixed(1)}">${'⭐'.repeat(n)}${'☆'.repeat(5-n)}</span>`; }
-    else stars.textContent='—';
+    if (r.stars!=null){ const n=Math.max(0,Math.min(5,Math.round(r.stars))); stars.innerHTML=`<span title="${r.stars.toFixed(1)}">${'⭐'.repeat(n)}${'☆'.repeat(5-n)}</span>`; } else stars.textContent='—';
     tr.appendChild(stars); tbody.appendChild(tr);
   }
 }
 
-$('file').addEventListener('change', async (e)=>{
-  const f = e.target.files[0]; if(!f) return;
-  const text = await f.text();
-  ingest(text);
+// events
+document.getElementById('file').addEventListener('change', (e)=>{
+  const f=e.target.files[0]; if(!f) return;
+  Papa.parse(f,{header:true,skipEmptyLines:true, dynamicTyping:false, complete:ingest, error:(err)=>{ const w=$('emptyWarn'); w.style.display='block'; w.textContent='CSV parse error: '+err; }});
 });
-
 ['axisMode','colorBy','minSpend','sizeScale','jitter','minStars'].forEach(id=>{
-  $(id).addEventListener('change', ()=>render());
-  $(id).addEventListener('input',  ()=>render());
+  $(id).addEventListener('change', render);
+  $(id).addEventListener('input', render);
 });
-
 $('weeks').addEventListener('change', ()=>{ updateWeeksInfo(); render(); });
-$('trend').addEventListener('click', ()=> computeTrend());
-
-function computeTrend(){
-  const sub = filteredSubset().filter(r => r.cpi!=null && r.ltv_0w!=null && r.cpi>=0 && r.ltv_0w>=0);
-  const stats = $('trendStats'); const tbody = document.querySelector('#qTable tbody'); tbody.innerHTML='';
-  if (sub.length<5){ stats.textContent='Not enough data after filters.'; Plotly.purge('insightChart'); return; }
-
-  const x = sub.map(r=>r.cpi), y=sub.map(r=>r.ltv_0w);
-  // Kendall's tau (no ties correction, good enough for quick check)
-  let C=0,D=0; for(let i=0;i<x.length;i++) for(let j=i+1;j<x.length;j++){ const s1=Math.sign(x[j]-x[i]); const s2=Math.sign(y[j]-y[i]); const p=s1*s2; if(p>0)C++; else if(p<0)D++; }
-  const n=x.length, denom=n*(n-1)/2; const tau = (C-D)/denom;
-  const varTau=(2*(2*n+5))/(9*n*(n-1)); const z=tau/Math.sqrt(varTau);
-  const Ncdf=z=>{const t=1/(1+0.2316419*Math.abs(z)), d=Math.exp(-z*z/2)/Math.sqrt(2*Math.PI);
-                 const p=1-d*(0.31938153*t-0.356563782*t**2+1.781477937*t**3-1.821255978*t**4+1.330274429*t**5);
-                 return z>=0?p:1-p;}
-  const p=2*(1-Ncdf(Math.abs(z)));
-
-  const xs=x.slice().sort((a,b)=>a-b); const q=p=> xs[Math.floor(p*(xs.length-1))];
-  const edges=[-Infinity,q(0.2),q(0.4),q(0.6),q(0.8),Infinity];
-  const buckets=[[],[],[],[],[]];
-  for(const r of sub){ let idx=4; for(let i=0;i<5;i++){ if (r.cpi<=edges[i+1]){idx=i; break;} } buckets[idx].push(r); }
-
-  const names=['Q1','Q2','Q3','Q4','Q5'];
-  const barY=[], barHover=[], barText=[];
-  const totalSpend=buckets.flat().reduce((s,r)=>s+(r.total_spend||0),0), totalInst=buckets.flat().reduce((s,r)=>s+(r.installs||0),0);
-
-  for(let i=0;i<5;i++){
-    const g=buckets[i], n=g.length;
-    if(!n){ barY.push(null); barHover.push('Empty'); barText.push(''); continue; }
-    const cpis=g.map(r=>r.cpi), ltvs=g.map(r=>r.ltv_0w);
-    const spend=g.reduce((s,r)=>s+(r.total_spend||0),0), inst=g.reduce((s,r)=>s+(r.installs||0),0);
-    const cpiMin=Math.min(...cpis), cpiMax=Math.max(...cpis), cpiAvg=cpis.reduce((s,v)=>s+v,0)/n;
-    const ltvAvg=ltvs.reduce((s,v)=>s+v,0)/n, ltvMed=ltvs.slice().sort((a,b)=>a-b)[Math.floor((n-1)/2)];
-    const spendShare= totalSpend>0? spend/totalSpend:0, instShare= totalInst>0? inst/totalInst:0;
-    barY.push(ltvAvg); barText.push(`$${cpiAvg.toFixed(2)} CPI`);
-    barHover.push(`CPI ${cpiMin.toFixed(3)}–${cpiMax.toFixed(3)}\navg $${cpiAvg.toFixed(3)}\nn=${n}, spend=$${spend.toLocaleString()} (${(spendShare*100).toFixed(1)}%)\ninstalls=${Math.round(inst).toLocaleString()} (${(instShare*100).toFixed(1)}%)\navg LTV ${ltvAvg.toFixed(3)}, median ${ltvMed.toFixed(3)}`);
-
-    // fill table
-    const tr=document.createElement('tr');
-    const td=(h,cls='')=>{const el=document.createElement('td'); if(cls) el.className=cls; el.textContent=h; tr.appendChild(el);};
-    const fmt=(v,p=3)=>v==null?'—':(Math.abs(v)>=1000? Math.round(v).toLocaleString(): v.toFixed(p));
-    td(names[i]); td(fmt(cpiMin)); td(fmt(cpiMax)); td('$'+fmt(cpiAvg,3)); td(fmt(ltvAvg,3)); td(fmt(ltvMed,3));
-    td(String(n),'num'); td('$'+fmt(spend,0)); td((spendShare*100).toFixed(1)+'%'); td(fmt(inst,0)); td((instShare*100).toFixed(1)+'%');
-    document.querySelector('#qTable tbody').appendChild(tr);
-  }
-
-  Plotly.newPlot('insightChart', [{x:names, y:barY, type:'bar', text:barText, textposition:'outside', hoverinfo:'text', hovertext:barHover}],
-    {title:'LTV 0W by CPI Quintile', yaxis:{title:'Avg LTV 0W'}, plot_bgcolor:'#0f1115', paper_bgcolor:'#0f1115', font:{color:'#eaecef'}, margin:{t:40}},
-    {responsive:true});
-
-  $('trendStats').textContent = `Kendall’s tau = ${tau.toFixed(3)}, p-value ≈ ${p.toExponential(2)} (n = ${n}).`;
-}
 
 </script>
 </body>
